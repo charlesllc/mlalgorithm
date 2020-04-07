@@ -1,1 +1,2 @@
+Author: charlesllc
 These are some merchine learning algrithms programmed by Python.
