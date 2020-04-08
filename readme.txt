@@ -1,2 +1,6 @@
 Author: charlesllc
-These are some merchine learning algrithms programmed by Python.
+关于目的：
+    一直在使用现成的算法包，学习算法原理，但实际上感觉一知半解。
+    最近开始使用Python实现流行的机器学习算法。
+关于code：
+    英文大神们都说让英语成为工作语言，所以code里的注释都是蹩脚的英文。
