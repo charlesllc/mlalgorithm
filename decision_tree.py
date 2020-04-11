@@ -35,8 +35,9 @@ class decision_tree(object):
     #compute the conditional entropy
     def con_entropy(self,x,y):
         if is_string_dtype(x):
-            prior_prob = x.groupby(x).count() / len(x)
-            post_ent = y.groupby(x).agg(self.entropy)
+            tmp = y.groupby(x).agg(['count',self.entropy])
+            prior_prob = tmp['count'] / tmp['count'].sum()
+            post_ent = tmp['entropy']
             con_ent = np.sum(prior_prob*post_ent)
             cutoff = list(prior_prob.index)
             prior_prob.index = list(range(len(prior_prob)))
@@ -48,9 +49,8 @@ class decision_tree(object):
             cutoffs = sorted(set([-np.inf] + list(ptil) + [np.inf]))
             labels = np.array([i for i in range(len(cutoffs)-1)])
             xs = pd.cut(x,cutoffs,labels=labels)
-            prior_cnt = xs.groupby(xs).count()
             post_cnt = y.groupby([y,xs]).count().unstack(level=0)
-            post_cnt['prior'] = prior_cnt
+            post_cnt['prior'] = post_cnt.sum(axis=1)
             post_cnt_cum = post_cnt.cumsum()
             post_cnt_cum_op = post_cnt_cum.iloc[-1]-post_cnt_cum
             prior_P0 = post_cnt_cum.iloc[0:-1,-1]/post_cnt_cum.iloc[-1,-1]
@@ -97,12 +97,14 @@ class decision_tree(object):
         if depth < self.max_depth-1 and len(ycnt) > 1:
             split,cutoff = self.split_node(X,y)
             model['node'] = split
-            is_list = isinstance(cutoff, list)
-            xs= X[split] if is_list else np.sign(np.sign(X[split]-cutoff)-1)
+            is_string = isinstance(cutoff, list)
+            xs= X[split] if is_string else np.sign(np.sign(X[split]-cutoff)-1)
             Xs = [item for _,item in X.groupby(xs)]
             ys = [item for _,item in y.groupby(xs)]
-            model['con'] = ['='+v for v in cutoff] if is_list else ['<='+str(cutoff), '>'+str(cutoff)]
-            model['confunc'] = [lambda x:x==v for v in cutoff] if is_list else [lambda x:x<=cutoff, lambda x:x>cutoff]
+            model['con'] = {}
+            model['con']['is_str'] = is_string
+            model['con']['bins'] = cutoff if is_string else [-np.inf, cutoff, np.inf]
+            #model['confunc'] = [lambda x:x==v for v in cutoff] if is_list else [lambda x:x<=cutoff, lambda x:x>cutoff]
             model['snode'] = [{} for v in range(len(ys))]
             for l in range(len(ys)):
                 self.__fit_base(Xs[l],ys[l], model=model['snode'][l], depth=depth+1)
@@ -110,42 +112,88 @@ class decision_tree(object):
     def fit(self,X,y):
         m,n=X.shape
         if isinstance(X, np.ndarray):
-            X = pd.DataFrame(X,columns=list(range(n)))
+            X = pd.DataFrame(X)
             y = pd.Series(y)
         else:
             self.columns_o = {k:v for v,k in zip(X.columns,range(n))}
             X.columns = list(range(n))
         self.__fit_base(X,y,model=self.model,depth=0)
 
-    def __predict_base(self,X,model={}):
+    '''predict'''
+    def __predict_base(self,X,y=np.array([]),model={}):
         m,n = X.shape
+        ypre = pd.Series(model['ypre'] * np.ones(m), index=X.index)
+        if len(y)>0:
+            model['err'] = np.sum(ypre != y)
         if 'node' not in model:
-            self._ypre.append(pd.Series(model['ypre'] * np.ones(m), index=X.index))
-        else:
-            confunc = model['confunc']
-            cnt = len(confunc)
-            def split_func(x):
-                for i in range(cnt):
-                    if confunc[i](x):
-                        return i
-                return cnt
-            xs = X[model['node']].map(split_func)
-            Xs = [item for _,item in X.groupby(xs)]
-            for j in range(len(Xs)):
-                self.__predict_base(Xs[j],model=model['snode'][j])
+            #ypre = pd.Series(model['ypre'] * np.ones(m), index=X.index)
+            self._ypre.append(ypre)
+        else:            
+            node = model['node']
+            is_str, bins = model['con']['is_str'], model['con']['bins']
+            label = bins if is_str else np.array(range(len(bins)-1))
+            xs = X[node] if is_str else pd.cut(X[node],bins,labels=label)
+            Xs = {k:v for k,v in X.groupby(xs)}
+            ys = {k:v for k,v in y.groupby(xs)} if len(y)>0 else {i:np.array([]) for i in range(len(Xs))}
+            for j in range(len(labels)):
+                key = labels[j]
+                if key in Xs:
+                    self.__predict_base(Xs[key],ys[key],model=model['snode'][j])
 
-    def predict(self,X):
+    def predict(self,X,y=np.array([])):
         if isinstance(X, np.ndarray):
             X = pd.DataFrame(X)
+            y = pd.Series(y)
         self._ypre = []
-        self.__predict_base(X,model=self.model)
+        self.__predict_base(X,y=y,model=self.model)
         return pd.concat(self._ypre).sort_index()
 
-#train a tree to fit the moons
-#m = 700
-#X, y = sklearn.datasets.make_moons(m,noise=0.4)
-#clf=decision_tree(20,split_rule='C4.5')
+    '''post prune'''
+    def __post_prune(self,model={}):
+        if 'snode' in model and 'err' in model:
+            subtrees = model['snode']
+            errs, traversal = 0, False
+            for j in range(len(subtrees)):
+                if 'snode' in subtrees[j]:
+                    traversal = True
+                    break
+                else:
+                    errs += subtrees[j]['err'] if 'err' in subtrees[j] else 0
+            if traversal:
+                for j in range(len(subtrees)):
+                    self.__post_prune(subtrees[j])
+            else:
+                errf = model['err']
+                if errf <= errs:
+                    model.pop('node')
+                    model.pop('snode')
+                    model.pop('con')
+
+    def post_prune(self,X,y):
+        err_b,err_a = 1,0
+        count = 1
+        while err_a < err_b:
+            print('The %dth pruning.' % count)
+            err_b = np.sum(self.predict(X,y) != y)
+            self.__post_prune(model=self.model)
+            err_a = np.sum(self.predict(X,y) != y)
+            count += 1
+
+##train a tree to fit the moons
+#m = 1000
+#X, y = sklearn.datasets.make_moons(m,noise=0.15)
+#clf=decision_tree(10,split_rule='GINI')
 #clf.fit(X,y)
-#plot_decision_boundary(X,y,feat_engi_func,clf.predict)
 #ypre=clf.predict(X)
-#np.sum(y==ypre)
+#print(np.sum(y==ypre))
+##plot_decision_boundary(X,y,feat_engi_func,clf.predict)
+#m = 400
+#Xt, yt = sklearn.datasets.make_moons(m,noise=0.15)
+#ytpre=clf.predict(Xt,yt)
+#print(np.sum(yt==ytpre))
+#plot_decision_boundary(Xt,yt,feat_engi_func,clf.predict)
+#
+#clf.post_prune(Xt,yt)
+#ytpre=clf.predict(Xt,yt)
+#print(np.sum(yt==ytpre))
+#plot_decision_boundary(Xt,yt,feat_engi_func,clf.predict)
